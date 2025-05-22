@@ -83,14 +83,24 @@ def update_overall_health_status():
     highest_priority_so_far = float('inf')
 
     with health_status_lock:
+        # Log current health states of all monitored URLs for diagnostics
+        if URLS_WITH_PRIORITY: # Ensure list is not empty before creating summary
+            current_statuses_summary = [(item['url'], item['healthy'], item['priority']) for item in URLS_WITH_PRIORITY]
+            logging.info(f"update_overall_health_status: Evaluating current statuses: {current_statuses_summary}")
+        else:
+            logging.info("update_overall_health_status: No URLs configured to evaluate.")
+
         # Sort by priority to check in order
         sorted_urls = sorted(URLS_WITH_PRIORITY, key=lambda x: x['priority'])
         
         for url_info in sorted_urls:
             if url_info['healthy']:
-                if url_info['priority'] < highest_priority_so_far:
+                # Since the list is sorted by priority (ascending),
+                # the first healthy URL found is the one with the highest priority.
+                if url_info['priority'] < highest_priority_so_far: # This check ensures we take the one with the numerically lowest priority
                     highest_priority_so_far = url_info['priority']
                     new_highest_priority_healthy_url = url_info['url']
+                    break  # Optimization: Found the highest priority healthy URL, no need to check further
         
         old_healthy_url = current_healthy_url_info['url']
         
@@ -99,11 +109,15 @@ def update_overall_health_status():
             current_healthy_url_info['priority'] = highest_priority_so_far
             if old_healthy_url != new_highest_priority_healthy_url:
                 logging.info(f"Primary healthy endpoint changed. New primary: {new_highest_priority_healthy_url} (P{highest_priority_so_far})")
+            else:
+                logging.info(f"Primary healthy endpoint remains: {new_highest_priority_healthy_url} (P{highest_priority_so_far})")
         else:
             current_healthy_url_info['url'] = None
             current_healthy_url_info['priority'] = float('inf')
             if old_healthy_url is not None:
                 logging.warning("All endpoints are down. No healthy URL available.")
+            else:
+                logging.info("No healthy URL available (was already None or no URLs configured).")
 
 
 def perform_health_checks():
@@ -113,14 +127,36 @@ def perform_health_checks():
         return
 
     logging.info("Health check monitoring thread started.")
+    loop_count = 0
     while True:
-        for url_info in URLS_WITH_PRIORITY:
-            is_healthy = check_url_health(url_info)
-            with health_status_lock:
-                url_info['healthy'] = is_healthy
-        
-        update_overall_health_status()
-        time.sleep(HEALTH_CHECK_INTERVAL_SECONDS)
+        loop_count += 1
+        logging.info(f"perform_health_checks: Starting loop iteration {loop_count}.")
+        try:
+            if not URLS_WITH_PRIORITY: # Re-check in case it became empty, though unlikely with current logic
+                logging.warning("perform_health_checks: URLS_WITH_PRIORITY is empty, cannot perform checks. Sleeping.")
+                time.sleep(HEALTH_CHECK_INTERVAL_SECONDS)
+                continue
+
+            logging.info(f"perform_health_checks: Iterating through {len(URLS_WITH_PRIORITY)} URLs for health checks.")
+            for url_info in URLS_WITH_PRIORITY:
+                is_healthy = check_url_health(url_info)
+                with health_status_lock:
+                    url_info['healthy'] = is_healthy
+            logging.info("perform_health_checks: Finished iterating through URLs.")
+            
+            update_overall_health_status()
+            
+            logging.info(f"perform_health_checks: Sleeping for {HEALTH_CHECK_INTERVAL_SECONDS} seconds before next iteration.")
+            time.sleep(HEALTH_CHECK_INTERVAL_SECONDS)
+            logging.info("perform_health_checks: Woke up from sleep.")
+
+        except Exception as e:
+            logging.error(f"perform_health_checks: Unhandled exception in health check loop: {e}", exc_info=True)
+            # Depending on the error, you might want to sleep for a bit before retrying
+            # to avoid tight loop of failures.
+            logging.info(f"perform_health_checks: Sleeping for {HEALTH_CHECK_INTERVAL_SECONDS} seconds after exception before retrying.")
+            time.sleep(HEALTH_CHECK_INTERVAL_SECONDS)
+
 
 @app.route('/healthy-endpoint', methods=['GET'])
 @app.route('/status', methods=['GET'])
