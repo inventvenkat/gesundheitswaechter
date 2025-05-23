@@ -29,6 +29,7 @@ app = Flask(__name__)
 HEALTH_CHECK_URLS_STR = os.environ.get('HEALTH_CHECK_URLS', '')
 HEALTH_CHECK_INTERVAL_SECONDS = int(os.environ.get('HEALTH_CHECK_INTERVAL_SECONDS', 5))
 HEALTH_CHECK_TIMEOUT_SECONDS = int(os.environ.get('HEALTH_CHECK_TIMEOUT_SECONDS', 2))
+WEBHOOK_URL = os.environ.get('WEBHOOK_URL', None) # New environment variable for webhook
 
 # Parse URLs and assign priorities
 URLS_WITH_PRIORITY = []
@@ -45,6 +46,10 @@ if not URLS_WITH_PRIORITY:
 logging.info(f"Gesundheitswächter (Health Guardian) 🛡️ starting up...")
 logging.info(f"Health Check Interval: {HEALTH_CHECK_INTERVAL_SECONDS} seconds")
 logging.info(f"Health Check Timeout: {HEALTH_CHECK_TIMEOUT_SECONDS} seconds")
+if WEBHOOK_URL:
+    logging.info(f"Webhook URL configured: {WEBHOOK_URL}")
+else:
+    logging.info("No Webhook URL configured.")
 if URLS_WITH_PRIORITY:
     logging.info("Monitoring the following URLs (Priority: URL):")
     for item in URLS_WITH_PRIORITY:
@@ -77,7 +82,7 @@ def check_url_health(url_info):
     except Exception as e:
         error_message = f"Unexpected error: {str(e)}"
 
-    url_info['last_checked'] = datetime.utcnow().isoformat()
+    url_info['last_checked'] = datetime.utcnow().isoformat() # Store as ISO format string
 
     if is_currently_healthy:
         logging.info(f"Health check SUCCESS for {url} (P{url_info['priority']}): HTTP {status_code}")
@@ -89,10 +94,11 @@ def check_url_health(url_info):
 def update_overall_health_status():
     """
     Updates the global health status based on individual URL checks.
-    This function should be called after health_info_list is updated.
+    Triggers a webhook if the primary healthy URL changes and a webhook URL is configured.
     """
     global current_healthy_url_info
     
+    previous_healthy_url = current_healthy_url_info['url'] # Store previous state for comparison
     new_highest_priority_healthy_url = None
     highest_priority_so_far = float('inf')
 
@@ -123,15 +129,50 @@ def update_overall_health_status():
             current_healthy_url_info['priority'] = highest_priority_so_far
             if old_healthy_url != new_highest_priority_healthy_url:
                 logging.info(f"Primary healthy endpoint changed. New primary: {new_highest_priority_healthy_url} (P{highest_priority_so_far})")
+                if WEBHOOK_URL:
+                    send_webhook_notification(old_healthy_url, new_highest_priority_healthy_url, highest_priority_so_far)
             else:
                 logging.info(f"Primary healthy endpoint remains: {new_highest_priority_healthy_url} (P{highest_priority_so_far})")
-        else:
+        else: # No healthy URL found
             current_healthy_url_info['url'] = None
             current_healthy_url_info['priority'] = float('inf')
-            if old_healthy_url is not None:
+            if old_healthy_url is not None: # It means we just lost all healthy URLs
                 logging.warning("All endpoints are down. No healthy URL available.")
+                if WEBHOOK_URL:
+                    send_webhook_notification(old_healthy_url, None, None) # Notify that no URL is healthy
             else:
                 logging.info("No healthy URL available (was already None or no URLs configured).")
+
+def send_webhook_notification(old_url, new_url, new_priority):
+    """Sends a notification to the configured webhook URL about the change in the healthy endpoint."""
+    if not WEBHOOK_URL:
+        logging.info("Webhook notification skipped: No WEBHOOK_URL configured.")
+        return
+
+    payload = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "event_type": "healthy_url_changed",
+        "previous_healthy_url": old_url,
+        "current_healthy_url": new_url,
+        "current_healthy_url_priority": new_priority,
+        "message": ""
+    }
+
+    if new_url:
+        payload["message"] = f"Healthy URL changed from '{old_url if old_url else 'None'}' to '{new_url}' (Priority: {new_priority})."
+    else:
+        payload["message"] = f"All monitored URLs are now unhealthy. Previous healthy URL was '{old_url if old_url else 'None'}'."
+
+
+    try:
+        logging.info(f"Sending webhook notification to {WEBHOOK_URL} with payload: {payload}")
+        response = requests.post(WEBHOOK_URL, json=payload, timeout=5) # 5 second timeout for webhook
+        response.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
+        logging.info(f"Webhook notification sent successfully to {WEBHOOK_URL}. Status: {response.status_code}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to send webhook notification to {WEBHOOK_URL}: {e}")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred while sending webhook to {WEBHOOK_URL}: {e}")
 
 
 def perform_health_checks():
